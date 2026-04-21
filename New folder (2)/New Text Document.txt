@@ -1,0 +1,80 @@
+import boto3
+import pymysql
+import csv
+import os
+import logging
+from io import TextIOWrapper
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    try:
+        # 1. Get S3 object details from the event
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        logger.info(f"Processing file s3://{bucket}/{key}")
+
+        # 2. Stream the CSV file from S3 (no need to load the whole file into memory)
+        response = s3.get_object(Bucket=bucket, Key=key)
+        # Wrap the streaming body in a text wrapper for csv.reader
+        csv_file = TextIOWrapper(response['Body'], encoding='utf-8')
+        csv_reader = csv.reader(csv_file)
+
+        # 3. Skip the header row (assumes first row contains column names)
+        header = next(csv_reader, None)
+        if header is None:
+            raise ValueError("CSV file is empty")
+
+        # 4. Connect to RDS MySQL using environment variables
+        connection = pymysql.connect(
+            host=os.environ['DB_HOST'],
+            user=os.environ['USER'],
+            password=os.environ['PASSWORD'],
+            database=os.environ['RDS_DB'],
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.Cursor
+        )
+
+        try:
+            with connection.cursor() as cursor:
+                # 5. Prepare batch insert (improves performance for many rows)
+                insert_sql = "INSERT INTO users (id, name, email) VALUES (%s, %s, %s)"
+                batch = []
+                batch_size = 1000  # adjust based on your row size
+
+                for row in csv_reader:
+                    # Validate that the row has exactly 3 columns
+                    if len(row) != 3:
+                        logger.warning(f"Skipping malformed row: {row}")
+                        continue
+                    batch.append((row[0], row[1], row[2]))
+
+                    if len(batch) >= batch_size:
+                        cursor.executemany(insert_sql, batch)
+                        connection.commit()
+                        batch.clear()
+
+                # Insert any remaining rows
+                if batch:
+                    cursor.executemany(insert_sql, batch)
+                    connection.commit()
+
+            logger.info(f"Successfully inserted data from {key}")
+
+        finally:
+            # Ensure the database connection is always closed
+            connection.close()
+
+        return {
+            'statusCode': 200,
+            'body': f'Successfully processed {key}'
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing file: {str(e)}", exc_info=True)
+        # Re-raise so Lambda's error handling (e.g., DLQ) can capture it
+        raise e

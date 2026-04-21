@@ -1,0 +1,96 @@
+import json
+import boto3
+import pandas as pd
+import os
+from datetime import datetime
+import pymysql
+from io import StringIO
+
+# AWS Clients
+s3_client = boto3.client('s3')
+sns_client = boto3.client('sns')
+
+# Environment Variables (configure in Lambda)
+SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+DB_HOST = os.environ['DB_HOST']
+DB_USER = os.environ['DB_USER']
+DB_PASSWORD = os.environ['DB_PASSWORD']
+DB_NAME = os.environ['DB_NAME']
+
+def lambda_handler(event, context):
+    try:
+        # Get bucket and file details from event
+        bucket_name = event['Records'][0]['s3']['bucket']['name']
+        file_key = event['Records'][0]['s3']['object']['key']
+
+        print(f"Processing file: {file_key}")
+
+        # Read file from S3
+        response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+        csv_content = response['Body'].read().decode('utf-8')
+
+        # Load into pandas DataFrame
+        df = pd.read_csv(StringIO(csv_content))
+
+        # Add processed timestamp column
+        df['processed_timestamp'] = datetime.utcnow().isoformat()
+
+        # Save processed file to new location
+        processed_key = f"processed/{file_key.split('/')[-1]}"
+        csv_buffer = StringIO()
+        df.to_csv(csv_buffer, index=False)
+
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=processed_key,
+            Body=csv_buffer.getvalue()
+        )
+
+        print(f"Processed file saved to: {processed_key}")
+
+        # Insert into RDS MySQL
+        connection = pymysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+
+        with connection.cursor() as cursor:
+            # Assuming table already exists with matching schema
+            for _, row in df.iterrows():
+                columns = ', '.join(row.index)
+                placeholders = ', '.join(['%s'] * len(row))
+                sql = f"INSERT INTO student_data ({columns}) VALUES ({placeholders})"
+                cursor.execute(sql, tuple(row))
+
+        connection.commit()
+        connection.close()
+
+        print("Data inserted into RDS successfully")
+
+        # Send SNS Notification
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="File Processed Successfully",
+            Message=f"File {file_key} processed and stored as {processed_key}"
+        )
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Processing completed successfully!')
+        }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="Processing Failed",
+            Message=str(e)
+        )
+
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Processing failed!')
+        }
